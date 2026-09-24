@@ -1,0 +1,444 @@
+"""PyTorch datasets for laboratory and Dataset-IV battery features."""
+
+from collections.abc import Iterable
+import logging
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import yaml
+from sklearn.preprocessing import StandardScaler
+from torch.utils.data import Dataset
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CONFIG_PATH = PROJECT_ROOT / "config.yaml"
+LOGGER = logging.getLogger(__name__)
+
+
+def load_config() -> dict:
+    """Load and validate the project configuration."""
+    with CONFIG_PATH.open(encoding="utf-8") as file:
+        config = yaml.safe_load(file)
+    if not isinstance(config, dict):
+        raise ValueError(f"Expected a mapping in {CONFIG_PATH}")
+    return config
+
+
+CONFIG = load_config()
+
+
+def validate_required_columns(dataframe, required):
+    missing = sorted(set(required).difference(dataframe.columns))
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+
+def validate_unique_rows(dataframe, columns):
+    if dataframe.duplicated(columns).any():
+        raise ValueError(f"Duplicate rows found for identifiers: {columns}")
+
+
+def validate_split_ids(dataframe, id_column, splits):
+    normalized = {
+        name: {int(value) for value in values}
+        for name, values in splits.items()
+    }
+    names = list(normalized)
+    for index, left_name in enumerate(names):
+        if not normalized[left_name]:
+            raise ValueError(f"{left_name} split is empty")
+        for right_name in names[index + 1:]:
+            overlap = normalized[left_name] & normalized[right_name]
+            if overlap:
+                raise ValueError(
+                    f"{left_name} and {right_name} splits overlap: {sorted(overlap)}"
+                )
+    available = {int(value) for value in dataframe[id_column].unique()}
+    requested = set().union(*normalized.values())
+    missing = sorted(requested - available)
+    if missing:
+        raise ValueError(f"Unknown {id_column} values in splits: {missing}")
+
+
+def generate_windows(dataframe):
+    rows = []
+    total_length = HISTORY_LENGTH + PREDICTION_LENGTH
+    for vehicle_id, vehicle in dataframe.groupby("vehicle_id", sort=False):
+        for start in range(len(vehicle) - total_length + 1):
+            rows.append(
+                {
+                    "vehicle_id": int(vehicle_id),
+                    "start": start,
+                    "history_end": start + HISTORY_LENGTH - 1,
+                    "target_end": start + total_length - 1,
+                }
+            )
+    return pd.DataFrame(
+        rows,
+        columns=["vehicle_id", "start", "history_end", "target_end"],
+    )
+
+
+def validate_window_splits(splits):
+    for name, windows in splits.items():
+        if windows.empty:
+            raise ValueError(
+                f"{name} split has no windows of length "
+                f"{HISTORY_LENGTH + PREDICTION_LENGTH}"
+            )
+
+
+def scale(dataframe, train_windows, feature_cols, return_scaler=False):
+    if train_windows.empty:
+        raise ValueError("The training split has no valid windows")
+    result = dataframe.copy()
+    result["soh_history_raw"] = result["SOH_hist"].astype(float)
+    train_ids = train_windows["vehicle_id"].unique()
+    train_rows = result["vehicle_id"].isin(train_ids)
+    scaler = StandardScaler()
+    scaler.fit(result.loc[train_rows, feature_cols])
+    result.loc[:, feature_cols] = scaler.transform(result[feature_cols])
+    if return_scaler:
+        return result, scaler
+    return result
+
+
+REAL_EV_FEATURES = list(CONFIG["features"]["real_ev"])
+MASK_FEATURES_COLS = [
+    column for column in REAL_EV_FEATURES if column.startswith("mask_")
+]
+DATA4_FEATURES_COLS = [
+    column for column in REAL_EV_FEATURES if column not in MASK_FEATURES_COLS
+]
+LAB_FEATURES_COLS = list(CONFIG["features"]["lab"])
+DATA4_FEATURES = Path(CONFIG["processed"]["real_ev"]) / "real_ev.csv"
+LAB_FEATURES = Path(CONFIG["processed"]["lab"]) / "lab.csv"
+HISTORY_LENGTH = int(CONFIG["sequence"]["history_length"])
+PREDICTION_LENGTH = int(CONFIG["sequence"]["prediction_length"])
+if HISTORY_LENGTH <= 0 or PREDICTION_LENGTH <= 0:
+    raise ValueError("Sequence lengths in config.yaml must be positive")
+if DATA4_FEATURES_COLS[:len(LAB_FEATURES_COLS)] != LAB_FEATURES_COLS:
+    raise ValueError(
+        "Data 4 features must begin with the lab features in the same order"
+    )
+IMAGE_SIZE = int(CONFIG["model"]["image_size"])
+MODEL_IMAGE_SHAPE = (IMAGE_SIZE, IMAGE_SIZE)
+DATA4_ID_COLUMNS = {"car": "vehicle_id", "charge_segment": "charge_block_id"}
+
+
+def soh_to_image(values, avg=None):
+    """Encode an SOH trajectory as a centered square summation image."""
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
+    if values.size < 2 or not np.isfinite(values).all():
+        raise ValueError("SOH trajectory must contain at least two finite values")
+    if avg is None:
+        avg = float(values.mean())
+    source_axis = np.linspace(0.0, 1.0, values.size)
+    image_axis = np.linspace(0.0, 1.0, MODEL_IMAGE_SHAPE[0])
+    resized = np.interp(image_axis, source_axis, values)
+    centered = resized - float(avg)
+    return (
+        (centered[:, None] + centered[None, :]) / 2.0
+    ).astype(np.float32)
+
+
+def image_to_soh(image, avg, n_points):
+    """Decode an SOH summation image back into a trajectory."""
+    if hasattr(image, "detach"):
+        image = image.detach().cpu().numpy()
+    image = np.asarray(image, dtype=np.float32)
+    if image.shape != MODEL_IMAGE_SHAPE:
+        raise ValueError(
+            f"SOH image must have shape {MODEL_IMAGE_SHAPE}; received {image.shape}"
+        )
+    trajectory = np.diag(image) + float(avg)
+    image_axis = np.linspace(0.0, 1.0, trajectory.size)
+    output_axis = np.linspace(0.0, 1.0, int(n_points))
+    return np.interp(output_axis, image_axis, trajectory).astype(np.float32)
+
+
+def _as_vehicle_ids(value):
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        return [int(value)]
+    return [int(vehicle_id) for vehicle_id in value]
+
+
+def load_data4_features(path=DATA4_FEATURES):
+    """Load Data4 and normalize its identifier columns."""
+    dataframe = pd.read_csv(path).rename(columns=DATA4_ID_COLUMNS)
+    required = {
+        "vehicle_id",
+        "charge_block_id",
+        *DATA4_FEATURES_COLS,
+        *MASK_FEATURES_COLS,
+        "SOH_ref",
+    }
+    validate_required_columns(dataframe, required)
+    dataframe = dataframe[
+        [
+            "vehicle_id",
+            "charge_block_id",
+            *DATA4_FEATURES_COLS,
+            *MASK_FEATURES_COLS,
+            "SOH_ref",
+        ]
+    ].copy()
+    dataframe["vehicle_id"] = dataframe["vehicle_id"].astype(int)
+    dataframe["charge_block_id"] = dataframe["charge_block_id"].astype(int)
+    dataframe = dataframe.sort_values(
+        ["vehicle_id", "charge_block_id"]
+    ).reset_index(drop=True)
+    if dataframe.isna().any().any():
+        raise ValueError("Data4 contains missing values in model columns")
+    validate_unique_rows(dataframe, ["vehicle_id", "charge_block_id"])
+    return dataframe
+
+
+class Data4MultimodalDataset(Dataset):
+    def __init__(
+        self,
+        windows,
+        vehicles,
+        feature_cols,
+        soh_to_image,
+    ):
+        self.windows = windows.reset_index(drop=True)
+        self.feature_cols = list(feature_cols)
+        self.soh_to_image = soh_to_image
+        self.vehicles = {
+            int(vehicle_id): vehicle.sort_values(
+                "charge_block_id"
+            ).reset_index(drop=True)
+            for vehicle_id, vehicle in vehicles.groupby("vehicle_id")
+        }
+
+    def __len__(self):
+        return len(self.windows)
+
+    def __getitem__(self, idx):
+        window = self.windows.iloc[idx]
+        vehicle_id = int(window["vehicle_id"])
+        start = int(window["start"])
+        history_end = int(window["history_end"])
+        target_end = int(window["target_end"])
+        vehicle = self.vehicles[vehicle_id]
+
+        sequence = vehicle.iloc[
+            start : history_end + 1
+        ][self.feature_cols].to_numpy(dtype=np.float32)
+
+        noisy_history = vehicle.iloc[
+            start : history_end + 1
+        ]["soh_history_raw"].to_numpy(dtype=np.float32)
+
+        clean_trajectory = vehicle.iloc[
+            start : target_end + 1
+        ]["SOH_ref"].to_numpy(dtype=np.float32)
+
+        future_soh = clean_trajectory[HISTORY_LENGTH:]
+        avg = float(np.mean(noisy_history))
+
+        input_image = np.asarray(
+            self.soh_to_image(noisy_history, avg=avg),
+            dtype=np.float32,
+        )
+        target_image = np.asarray(
+            self.soh_to_image(clean_trajectory, avg=avg),
+            dtype=np.float32,
+        )
+        if input_image.shape != MODEL_IMAGE_SHAPE:
+            raise ValueError(
+                f"Input SOH image must have shape {MODEL_IMAGE_SHAPE}; "
+                f"received {input_image.shape}"
+            )
+        if target_image.shape != MODEL_IMAGE_SHAPE:
+            raise ValueError(
+                f"Target SOH image must have shape {MODEL_IMAGE_SHAPE}; "
+                f"received {target_image.shape}"
+            )
+        if not np.isfinite(input_image).all() or not np.isfinite(target_image).all():
+            raise ValueError("SOH image conversion produced NaN or infinite values")
+
+        last_soh = float(noisy_history[-1])
+
+        return (
+            torch.tensor(input_image, dtype=torch.float32),
+            torch.tensor(sequence, dtype=torch.float32),
+            torch.tensor(target_image, dtype=torch.float32),
+            torch.tensor(future_soh, dtype=torch.float32),
+            torch.tensor(avg, dtype=torch.float32),
+            torch.tensor(last_soh, dtype=torch.float32),
+        )
+
+
+def create_data4_multimodal_datasets(
+    train_ids,
+    val_id,
+    test_id,
+    soh_to_image,
+    feature_cols=DATA4_FEATURES_COLS,
+    return_scaler=False,
+):
+    feature_cols = list(feature_cols)
+    train_ids = _as_vehicle_ids(train_ids)
+    val_ids = _as_vehicle_ids(val_id)
+    test_ids = _as_vehicle_ids(test_id)
+
+    data4_df = load_data4_features()
+    validate_split_ids(
+        data4_df,
+        "vehicle_id",
+        {"train": train_ids, "val": val_ids, "test": test_ids},
+    )
+    windows = generate_windows(data4_df)
+
+    train_windows = windows[windows["vehicle_id"].isin(train_ids)]
+    val_windows = windows[windows["vehicle_id"].isin(val_ids)]
+    test_windows = windows[windows["vehicle_id"].isin(test_ids)]
+    validate_window_splits(
+        {
+            "train": train_windows,
+            "val": val_windows,
+            "test": test_windows,
+        }
+    )
+
+    scaled = scale(
+        data4_df,
+        train_windows,
+        feature_cols,
+        return_scaler=return_scaler,
+    )
+    if return_scaler:
+        data4_df_scaled, data4_scaler = scaled
+    else:
+        data4_df_scaled = scaled
+
+    datasets = (
+        Data4MultimodalDataset(
+            train_windows, data4_df_scaled, feature_cols, soh_to_image
+        ),
+        Data4MultimodalDataset(
+            val_windows, data4_df_scaled, feature_cols, soh_to_image
+        ),
+        Data4MultimodalDataset(
+            test_windows, data4_df_scaled, feature_cols, soh_to_image
+        ),
+    )
+    LOGGER.info(
+        "Created Data 4 datasets: train=%d, val=%d, test=%d windows",
+        *(len(dataset) for dataset in datasets),
+    )
+    if return_scaler:
+        return (*datasets, data4_scaler)
+    return datasets
+
+
+LAB_ID_COLUMNS = {
+    "cell_index": "vehicle_id",
+    "cycle_index": "charge_block_id",
+}
+
+
+def load_lab_features(path=LAB_FEATURES):
+    """Load lab features and normalize them to the shared model schema."""
+    dataframe = pd.read_csv(path).rename(columns=LAB_ID_COLUMNS)
+    required = {
+        "vehicle_id",
+        "charge_block_id",
+        *LAB_FEATURES_COLS,
+    }
+    validate_required_columns(dataframe, required)
+    dataframe = dataframe[
+        [
+            "vehicle_id",
+            "charge_block_id",
+            *LAB_FEATURES_COLS,
+        ]
+    ].copy()
+
+    invalid_rows = dataframe.isna().any(axis=1)
+    if invalid_rows.any():
+        LOGGER.warning(
+            "Dropping %d lab rows with missing model features",
+            int(invalid_rows.sum()),
+        )
+        dataframe = dataframe.loc[~invalid_rows].copy()
+
+    dataframe["vehicle_id"] = dataframe["vehicle_id"].astype(int)
+    dataframe["charge_block_id"] = dataframe["charge_block_id"].astype(int)
+    dataframe["SOH_ref"] = dataframe["SOH_hist"].astype(float)
+    dataframe = dataframe.sort_values(
+        ["vehicle_id", "charge_block_id"]
+    ).reset_index(drop=True)
+    validate_unique_rows(dataframe, ["vehicle_id", "charge_block_id"])
+    return dataframe
+
+
+class LabMultimodalDataset(Data4MultimodalDataset):
+    """Multimodal sliding-window dataset for laboratory battery cells."""
+
+
+def create_lab_multimodal_datasets(
+    train_ids,
+    val_id,
+    test_id,
+    soh_to_image,
+    feature_cols=LAB_FEATURES_COLS,
+    return_scaler=False,
+):
+    """Create group-disjoint train, validation, and test lab datasets."""
+    feature_cols = list(feature_cols)
+    train_ids = _as_vehicle_ids(train_ids)
+    val_ids = _as_vehicle_ids(val_id)
+    test_ids = _as_vehicle_ids(test_id)
+
+    lab_df = load_lab_features()
+    validate_split_ids(
+        lab_df,
+        "vehicle_id",
+        {"train": train_ids, "val": val_ids, "test": test_ids},
+    )
+    windows = generate_windows(lab_df)
+
+    train_windows = windows[windows["vehicle_id"].isin(train_ids)]
+    val_windows = windows[windows["vehicle_id"].isin(val_ids)]
+    test_windows = windows[windows["vehicle_id"].isin(test_ids)]
+    validate_window_splits(
+        {
+            "train": train_windows,
+            "val": val_windows,
+            "test": test_windows,
+        }
+    )
+
+    scaled = scale(
+        lab_df,
+        train_windows,
+        feature_cols,
+        return_scaler=return_scaler,
+    )
+    if return_scaler:
+        lab_df_scaled, lab_scaler = scaled
+    else:
+        lab_df_scaled = scaled
+
+    datasets = (
+        LabMultimodalDataset(
+            train_windows, lab_df_scaled, feature_cols, soh_to_image
+        ),
+        LabMultimodalDataset(
+            val_windows, lab_df_scaled, feature_cols, soh_to_image
+        ),
+        LabMultimodalDataset(
+            test_windows, lab_df_scaled, feature_cols, soh_to_image
+        ),
+    )
+    LOGGER.info(
+        "Created lab datasets: train=%d, val=%d, test=%d windows",
+        *(len(dataset) for dataset in datasets),
+    )
+    if return_scaler:
+        return (*datasets, lab_scaler)
+    return datasets

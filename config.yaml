@@ -1,0 +1,122 @@
+raw:
+  lab: '/home/adnane/Desktop/SOH_mlops/data/raw/data 1'
+  real_ev: '/home/adnane/Desktop/SOH_mlops/data/raw/data 4'
+
+processed:
+  lab: '/home/adnane/Desktop/SOH_mlops/data/processed/lab'
+  real_ev: '/home/adnane/Desktop/SOH_mlops/data/processed/data4'
+
+
+sequence:
+  history_length: 100
+  prediction_length: 10
+
+features:
+  lab:
+    - t40_50
+    - t50_60
+    - t60_70
+    - t70_80
+    - t80_90
+    - t90_100
+    - SOH_hist
+    - voltage_mean
+    - voltage_std
+    - current_mean
+    - current_std
+    - max_temp_mean
+    - min_temp_std
+    - voltage_slope
+    - max_cell_voltage_at_80
+  real_ev:
+    - t40_50
+    - t50_60
+    - t60_70
+    - t70_80
+    - t80_90
+    - t90_100
+    - SOH_hist
+    - voltage_mean
+    - voltage_std
+    - current_mean
+    - current_std
+    - max_temp_mean
+    - min_temp_std
+    - voltage_slope
+    - max_cell_voltage_at_80
+    - max_voltage_mean
+    - max_voltage_std
+    - min_voltage_mean
+    - min_voltage_std
+    - min_temp_mean
+    - voltage_diff_mean
+    - voltage_diff_std
+    - temp_diff_std
+    - mask_t40_50
+    - mask_t50_60
+    - mask_t60_70
+    - mask_t70_80
+    - mask_t80_90
+    - mask_t90_100
+    - mask_v80
+
+model:
+  name: multimodal_soh
+  hidden_size: 128
+  num_layers: 2
+  image_size: 256
+  freeze_visual_during_finetuning: true
+
+training:
+  stages:
+    - lab
+    - data4
+  seed: 42
+  device: auto
+  num_workers: 0
+  gradient_clip_norm: 1.0
+  optimizer: adamw
+  loss: image_mse
+  scheduler: reduce_on_plateau
+  splits:
+    lab:
+      train_fraction: 0.80
+      validation_fraction: 0.10
+    data4:
+      train_fraction: 0.80
+      validation_fraction: 0.10
+  lab:
+    run_name: lab-pretraining
+    epochs: 100
+    batch_size: 8
+    learning_rate: 0.0001
+    weight_decay: 0.00001
+    lstm_dropout: 0.30
+    feature_dropout: 0.20
+    early_stopping_patience: 15
+    scheduler_factor: 0.50
+    scheduler_patience: 5
+    minimum_learning_rate: 0.000001
+  data4:
+    run_name: data4-finetuning
+    epochs: 50
+    batch_size: 8
+    learning_rate: 0.00001
+    weight_decay: 0.00001
+    lstm_dropout: 0.30
+    feature_dropout: 0.20
+    early_stopping_patience: 10
+    scheduler_factor: 0.50
+    scheduler_patience: 4
+    minimum_learning_rate: 0.0000001
+
+artifacts:
+  root: data/artifacts
+  lab_directory: lab_pretraining
+  data4_directory: data4_finetuning
+
+mlflow:
+  enabled: true
+  tracking_uri_environment_variable: MLFLOW_URI
+  experiment_name: soh-multimodal
+  log_pytorch_model: true

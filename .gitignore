@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.py[cod]
+*.csv
+*.mat
+*.zip
+*.tar.gz
+data/raw/data 4/battery_dataset1

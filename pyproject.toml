@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "SOH-MLOPS"
+version = "0.1.0"
+requires-python = ">=3.10"
+
+dependencies = [
+    "pandas",
+    "numpy",
+    "PyYAML",
+    "EMD-signal",
+    "h5py",
+    "scikit-learn",
+    "joblib",
+    "ucimlrepo",
+
+    "torch",
+    "mlflow",
+
+    "fastapi",
+    "uvicorn[standard]",
+
+    "python-dotenv",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+namespaces = true
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "httpx",
+]
+
+
+[tool.setuptools.package-data]
+src = ["config.yaml"]
