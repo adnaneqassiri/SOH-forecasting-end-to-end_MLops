@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import torch
 import yaml
+from scipy.interpolate import CubicSpline
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import Dataset
 
@@ -124,38 +125,90 @@ if DATA4_FEATURES_COLS[:len(LAB_FEATURES_COLS)] != LAB_FEATURES_COLS:
     )
 IMAGE_SIZE = int(CONFIG["model"]["image_size"])
 MODEL_IMAGE_SHAPE = (IMAGE_SIZE, IMAGE_SIZE)
+SOH_IMAGE_HALF_RANGE = 0.08
+IMAGE_REPRESENTATION = "raster_curve_argmin_spline_v1"
 DATA4_ID_COLUMNS = {"car": "vehicle_id", "charge_segment": "charge_block_id"}
 
 
 def soh_to_image(values, avg=None):
-    """Encode an SOH trajectory as a centered square summation image."""
+    """Rasterize an SOH trajectory using the paper's fixed coordinate window.
+
+    A trajectory is drawn as a black, one-pixel curve on a white image. The
+    horizontal axis spans the complete history-plus-prediction window, so a
+    history-only input leaves the prediction portion blank. The vertical axis
+    represents avg +/- 0.08.
+    """
     values = np.asarray(values, dtype=np.float32).reshape(-1)
     if values.size < 2 or not np.isfinite(values).all():
         raise ValueError("SOH trajectory must contain at least two finite values")
+    total_length = HISTORY_LENGTH + PREDICTION_LENGTH
+    if values.size > total_length:
+        raise ValueError(
+            f"SOH trajectory has {values.size} points; expected at most "
+            f"{total_length}"
+        )
     if avg is None:
         avg = float(values.mean())
-    source_axis = np.linspace(0.0, 1.0, values.size)
-    image_axis = np.linspace(0.0, 1.0, MODEL_IMAGE_SHAPE[0])
-    resized = np.interp(image_axis, source_axis, values)
-    centered = resized - float(avg)
-    return (
-        (centered[:, None] + centered[None, :]) / 2.0
-    ).astype(np.float32)
+    if not np.isfinite(avg):
+        raise ValueError("Average SOH must be finite")
+
+    height, width = MODEL_IMAGE_SHAPE
+    image = np.ones(MODEL_IMAGE_SHAPE, dtype=np.float32)
+    x_pixels = (
+        np.arange(values.size, dtype=np.float64)
+        * (width - 1)
+        / (total_length - 1)
+    )
+    y_pixels = (
+        height
+        * (float(avg) + SOH_IMAGE_HALF_RANGE - values)
+        / (2.0 * SOH_IMAGE_HALF_RANGE)
+    )
+    y_pixels = np.clip(y_pixels, 0.0, height - 1)
+
+    for index in range(values.size - 1):
+        x_start, x_end = x_pixels[index : index + 2]
+        y_start, y_end = y_pixels[index : index + 2]
+        steps = max(
+            2,
+            int(np.ceil(max(abs(x_end - x_start), abs(y_end - y_start)))) + 1,
+        )
+        columns = np.rint(
+            np.linspace(x_start, x_end, steps)
+        ).astype(int)
+        rows = np.rint(
+            np.linspace(y_start, y_end, steps)
+        ).astype(int)
+        image[rows, columns] = 0.0
+
+    return image
 
 
 def image_to_soh(image, avg, n_points):
-    """Decode an SOH summation image back into a trajectory."""
+    """Decode a rasterized SOH curve with column argmin and spline sampling."""
     if hasattr(image, "detach"):
         image = image.detach().cpu().numpy()
-    image = np.asarray(image, dtype=np.float32)
+    image = np.asarray(image, dtype=np.float64).squeeze()
     if image.shape != MODEL_IMAGE_SHAPE:
         raise ValueError(
             f"SOH image must have shape {MODEL_IMAGE_SHAPE}; received {image.shape}"
         )
-    trajectory = np.diag(image) + float(avg)
-    image_axis = np.linspace(0.0, 1.0, trajectory.size)
-    output_axis = np.linspace(0.0, 1.0, int(n_points))
-    return np.interp(output_axis, image_axis, trajectory).astype(np.float32)
+    if not np.isfinite(image).all() or not np.isfinite(avg):
+        raise ValueError("SOH image and average must contain only finite values")
+    n_points = int(n_points)
+    if n_points < 2:
+        raise ValueError("Decoded SOH trajectory must contain at least two points")
+
+    height, width = MODEL_IMAGE_SHAPE
+    pixel_rows = np.argmin(image, axis=0).astype(np.float64)
+    pixel_soh = (
+        (1.0 - pixel_rows / height) * (2.0 * SOH_IMAGE_HALF_RANGE)
+        + float(avg)
+        - SOH_IMAGE_HALF_RANGE
+    )
+    pixel_axis = np.arange(width, dtype=np.float64)
+    output_axis = np.linspace(0.0, width - 1, n_points)
+    return CubicSpline(pixel_axis, pixel_soh)(output_axis).astype(np.float32)
 
 
 def _as_vehicle_ids(value):

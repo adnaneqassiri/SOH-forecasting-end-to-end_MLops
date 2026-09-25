@@ -6,6 +6,14 @@ processed:
   lab: '/home/adnane/Desktop/SOH_mlops/data/processed/lab'
   real_ev: '/home/adnane/Desktop/SOH_mlops/data/processed/data4'
 
+processing:
+  lab:
+    nominal_capacity: 1.1
+    outlier_threshold: 0.02
+  data4:
+    top_n: 30
+    max_imf: 6
+
 
 sequence:
   history_length: 100
@@ -73,8 +81,9 @@ training:
     - data4
   seed: 42
   device: auto
-  num_workers: 0
+  num_workers: 2
   gradient_clip_norm: 1.0
+  progress_bar: true
   optimizer: adamw
   loss: image_mse
   scheduler: reduce_on_plateau
@@ -83,31 +92,32 @@ training:
       train_fraction: 0.80
       validation_fraction: 0.10
     data4:
-      train_fraction: 0.80
-      validation_fraction: 0.10
+      train: [2, 4, 11, 14, 23, 34, 36, 50, 56, 57, 91, 131, 139, 141, 150, 155, 157, 165]
+      val: [3, 51, 108, 119, 129, 140]
+      test: [16, 67, 69, 152, 175, 176]
   lab:
     run_name: lab-pretraining
-    epochs: 100
-    batch_size: 8
-    learning_rate: 0.0001
+    epochs: 1
+    batch_size: 32
+    learning_rate: 0.0003
     weight_decay: 0.00001
     lstm_dropout: 0.30
     feature_dropout: 0.20
     early_stopping_patience: 15
     scheduler_factor: 0.50
-    scheduler_patience: 5
+    scheduler_patience: 2
     minimum_learning_rate: 0.000001
   data4:
     run_name: data4-finetuning
-    epochs: 50
-    batch_size: 8
-    learning_rate: 0.00001
-    weight_decay: 0.00001
-    lstm_dropout: 0.30
+    epochs: 30
+    batch_size: 16
+    learning_rate: 0.0001
+    weight_decay: 0.0001
+    lstm_dropout: 0.20
     feature_dropout: 0.20
-    early_stopping_patience: 10
+    early_stopping_patience: 6
     scheduler_factor: 0.50
-    scheduler_patience: 4
+    scheduler_patience: 1
     minimum_learning_rate: 0.0000001
 
 artifacts:
@@ -118,5 +128,5 @@ artifacts:
 mlflow:
   enabled: true
   tracking_uri_environment_variable: MLFLOW_URI
-  experiment_name: soh-multimodal
+  experiment_name: soh-training
   log_pytorch_model: true

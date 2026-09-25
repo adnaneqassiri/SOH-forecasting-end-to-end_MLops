@@ -45,6 +45,7 @@ def load_config() -> dict:
 
 
 CONFIG = load_config()
+DATA4_PROCESSING = CONFIG["processing"]["data4"]
 
 
 REAL_EV_FEATURES = list(CONFIG["features"]["real_ev"])
@@ -97,10 +98,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--report", type=Path, default=DEFAULT_REPORT)
-    parser.add_argument("--top-n", type=int, default=30)
+    parser.add_argument(
+        "--top-n",
+        type=int,
+        default=int(DATA4_PROCESSING["top_n"]),
+    )
     parser.add_argument("--history-length", type=int, default=100)
     parser.add_argument("--prediction-length", type=int, default=10)
-    parser.add_argument("--max-imf", type=int, default=6)
+    parser.add_argument(
+        "--max-imf",
+        type=int,
+        default=int(DATA4_PROCESSING["max_imf"]),
+    )
     parser.add_argument(
         "--progress-every",
         type=int,

@@ -1,5 +1,6 @@
 """Config-driven lab pretraining and Data 4 fine-tuning with MLflow."""
 
+import argparse
 from contextlib import nullcontext
 import json
 import logging
@@ -16,9 +17,11 @@ import torch.nn as nn
 import yaml
 from dotenv import load_dotenv
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from src.data.datasets import (
     DATA4_FEATURES_COLS,
+    IMAGE_REPRESENTATION,
     LAB_FEATURES_COLS,
     PREDICTION_LENGTH,
     create_data4_multimodal_datasets,
@@ -35,6 +38,27 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = PROJECT_ROOT / "config.yaml"
 ENV_PATH = PROJECT_ROOT / ".env"
 LOGGER = logging.getLogger(__name__)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--stage",
+        choices=("lab", "data4", "all"),
+        help=(
+            "Run one stage or both stages. When omitted, use "
+            "training.stages from config.yaml."
+        ),
+    )
+    return parser.parse_args()
+
+
+def resolve_stages(config, stage_override=None):
+    if stage_override == "all":
+        return ["lab", "data4"]
+    if stage_override is not None:
+        return [stage_override]
+    return list(config["training"]["stages"])
 
 
 def load_config():
@@ -68,6 +92,42 @@ def resolve_device(name):
 
 def split_group_ids(dataframe, split_config, seed):
     ids = dataframe["vehicle_id"].drop_duplicates().to_numpy(dtype=int)
+    explicit_keys = {"train", "val", "test"}
+    if explicit_keys.issubset(split_config):
+        split = {
+            name: [int(value) for value in split_config[name]]
+            for name in ("train", "val", "test")
+        }
+        available = set(ids.tolist())
+        assigned = set()
+        for name, values in split.items():
+            if not values:
+                raise ValueError(f"The explicit {name} split is empty")
+            if len(values) != len(set(values)):
+                raise ValueError(
+                    f"The explicit {name} split contains duplicate IDs"
+                )
+            unknown = sorted(set(values) - available)
+            if unknown:
+                raise ValueError(
+                    f"The explicit {name} split contains unknown vehicle IDs: "
+                    f"{unknown}"
+                )
+            overlap = sorted(assigned.intersection(values))
+            if overlap:
+                raise ValueError(
+                    f"Explicit vehicle splits overlap at IDs: {overlap}"
+                )
+            assigned.update(values)
+
+        unassigned = sorted(available - assigned)
+        if unassigned:
+            raise ValueError(
+                "Explicit vehicle splits do not assign IDs: "
+                f"{unassigned}"
+            )
+        return split
+
     rng = np.random.default_rng(seed)
     rng.shuffle(ids)
     train_fraction = float(split_config["train_fraction"])
@@ -132,12 +192,21 @@ def create_loaders(datasets, stage_config, training_config, device, seed):
     )
 
 
-def mean_image_loss(model, loader, criterion, device):
+def mean_image_loss(
+    model, loader, criterion, device, description, show_progress
+):
     model.eval()
     total_loss = 0.0
     total_samples = 0
+    progress = tqdm(
+        loader,
+        desc=description,
+        unit="batch",
+        leave=False,
+        disable=not show_progress,
+    )
     with torch.no_grad():
-        for input_image, sequence, target_image, _, _, _ in loader:
+        for input_image, sequence, target_image, _, _, _ in progress:
             input_image = input_image.to(device, non_blocking=True)
             sequence = sequence.to(device, non_blocking=True)
             target_image = target_image.to(device, non_blocking=True)
@@ -145,6 +214,9 @@ def mean_image_loss(model, loader, criterion, device):
             batch_size = input_image.shape[0]
             total_loss += loss.item() * batch_size
             total_samples += batch_size
+            progress.set_postfix(
+                mse=f"{total_loss / total_samples:.6f}"
+            )
     return total_loss / total_samples
 
 
@@ -173,7 +245,13 @@ def train_model(
 
         total_loss = 0.0
         total_samples = 0
-        for input_image, sequence, target_image, _, _, _ in train_loader:
+        progress = tqdm(
+            train_loader,
+            desc=f"Train {epoch}/{stage_config['epochs']}",
+            unit="batch",
+            disable=not bool(training_config["progress_bar"]),
+        )
+        for input_image, sequence, target_image, _, _, _ in progress:
             input_image = input_image.to(device, non_blocking=True)
             sequence = sequence.to(device, non_blocking=True)
             target_image = target_image.to(device, non_blocking=True)
@@ -188,9 +266,19 @@ def train_model(
             batch_size = input_image.shape[0]
             total_loss += loss.item() * batch_size
             total_samples += batch_size
+            progress.set_postfix(
+                mse=f"{total_loss / total_samples:.6f}"
+            )
 
         train_loss = total_loss / total_samples
-        val_loss = mean_image_loss(model, val_loader, criterion, device)
+        val_loss = mean_image_loss(
+            model,
+            val_loader,
+            criterion,
+            device,
+            description=f"Validate {epoch}/{stage_config['epochs']}",
+            show_progress=bool(training_config["progress_bar"]),
+        )
         scheduler.step(val_loss)
         learning_rate = float(optimizer.param_groups[0]["lr"])
         epoch_seconds = time.time() - started
@@ -220,6 +308,7 @@ def train_model(
                     "model_state_dict": model.state_dict(),
                     "epoch": epoch,
                     "best_val_image_mse": best_loss,
+                    "image_representation": IMAGE_REPRESENTATION,
                 },
                 checkpoint_path,
             )
@@ -264,8 +353,28 @@ def setup_mlflow(config):
             f"{variable_name} must be an HTTP or HTTPS URL"
         )
     import mlflow
+    from mlflow.entities import ViewType
+    from mlflow.tracking import MlflowClient
+
     mlflow.set_tracking_uri(tracking_uri)
-    mlflow.set_experiment(mlflow_config["experiment_name"])
+    experiment_name = mlflow_config["experiment_name"]
+    client = MlflowClient(tracking_uri=tracking_uri)
+    experiment = next(
+        (
+            candidate
+            for candidate in client.search_experiments(view_type=ViewType.ALL)
+            if candidate.name == experiment_name
+        ),
+        None,
+    )
+    if experiment is not None and experiment.lifecycle_stage == "deleted":
+        LOGGER.warning(
+            "Restoring deleted MLflow experiment %s (ID %s)",
+            experiment_name,
+            experiment.experiment_id,
+        )
+        client.restore_experiment(experiment.experiment_id)
+    mlflow.set_experiment(experiment_name)
     return mlflow
 
 
@@ -318,6 +427,14 @@ def run_stage(stage, config, device, mlflow_module):
         checkpoint = torch.load(
             lab_checkpoint, map_location=device, weights_only=False
         )
+        checkpoint_representation = checkpoint.get("image_representation")
+        if checkpoint_representation != IMAGE_REPRESENTATION:
+            raise ValueError(
+                f"{lab_checkpoint} uses image representation "
+                f"{checkpoint_representation!r}, but this training run requires "
+                f"{IMAGE_REPRESENTATION!r}. Retrain the lab stage before Data 4 "
+                "fine-tuning."
+            )
         model = load_pretrained_multimodal(
             model,
             checkpoint,
@@ -357,6 +474,7 @@ def run_stage(stage, config, device, mlflow_module):
                 **flatten_params(config["model"], "model"),
                 **flatten_params(stage_config, "training"),
                 "dataset": stage,
+                "image_representation": IMAGE_REPRESENTATION,
                 "features": json.dumps(features),
                 "train_groups": len(split["train"]),
                 "validation_groups": len(split["val"]),
@@ -414,18 +532,21 @@ def run_stage(stage, config, device, mlflow_module):
                 str(output_directory), artifact_path="training_outputs"
             )
             if bool(config["mlflow"]["log_pytorch_model"]):
-                mlflow_module.pytorch.log_model(model, name="model")
+                mlflow_module.pytorch.log_model(
+                    model, artifact_path="model"
+                )
 
     return {"stage": stage, **final_metrics}
 
 
 def main():
+    args = parse_args()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
     config = load_config()
-    stages = list(config["training"]["stages"])
+    stages = resolve_stages(config, args.stage)
     unknown_stages = set(stages).difference({"lab", "data4"})
     if unknown_stages:
         raise ValueError(f"Unknown training stages: {sorted(unknown_stages)}")

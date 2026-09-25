@@ -14,7 +14,6 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = PROJECT_ROOT / "config.yaml"
-NOMINAL_CAPACITY = 1.1
 SOC_INTERVALS = (
     (40, 50),
     (50, 60),
@@ -45,6 +44,13 @@ config = load_config()
 
 RAW_DIR = Path(config["raw"]["lab"])
 FEATURES = config["features"]["lab"]
+LAB_PROCESSING = config["processing"]["lab"]
+NOMINAL_CAPACITY = float(LAB_PROCESSING["nominal_capacity"])
+OUTLIER_THRESHOLD = float(LAB_PROCESSING["outlier_threshold"])
+if NOMINAL_CAPACITY <= 0:
+    raise ValueError("processing.lab.nominal_capacity must be positive")
+if OUTLIER_THRESHOLD <= 0:
+    raise ValueError("processing.lab.outlier_threshold must be positive")
 OUTPUT_PATH = Path(config["processed"]["lab"])
 OUTPUT_PATH = OUTPUT_PATH / "lab.csv"
 
@@ -614,6 +620,22 @@ def clean_dataset(
             "cycle_index",
         ]
     )
+
+    local_median = df.groupby("cell_id")["SOH_hist"].transform(
+        lambda values: values.rolling(
+            window=5,
+            center=True,
+            min_periods=1,
+        ).median()
+    )
+    outliers = (df["SOH_hist"] - local_median).abs() > OUTLIER_THRESHOLD
+    if outliers.any():
+        LOGGER.warning(
+            "Dropping %d lab SOH outliers beyond %.4f of the local median",
+            int(outliers.sum()),
+            OUTLIER_THRESHOLD,
+        )
+        df = df.loc[~outliers]
 
     return df.reset_index(drop=True)
 
