@@ -51,6 +51,22 @@ automatically:
 python -m src.inference.predict vehicle.csv --output predictions.csv
 ```
 
+## CI/CD
+
+The workflow in `.github/workflows/ci-cd.yml` tests pull requests and, after a
+push to `master`, publishes `DOCKERHUB_USERNAME/soh-app` and deploys the API and
+Streamlit containers to EC2.
+
+The model assets are not committed to Git. Provision these files once on EC2:
+
+```text
+$HOME/soh-runtime/data/artifacts/data4_finetuning/best_model.pth
+$HOME/soh-runtime/data/artifacts/data4_finetuning/scaler.joblib
+$HOME/soh-runtime/data/processed/data4/real_ev.csv
+```
+
+The API is exposed on port `8000` and Streamlit on port `8501`.
+
 ---
 
 sudo apt update

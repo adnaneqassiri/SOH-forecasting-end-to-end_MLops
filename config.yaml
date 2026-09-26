@@ -1,10 +1,10 @@
 raw:
-  lab: '/home/adnane/Desktop/SOH_mlops/data/raw/data 1'
-  real_ev: '/home/adnane/Desktop/SOH_mlops/data/raw/data 4'
+  lab: 'data/raw/data 1'
+  real_ev: 'data/raw/data 4'
 
 processed:
-  lab: '/home/adnane/Desktop/SOH_mlops/data/processed/lab'
-  real_ev: '/home/adnane/Desktop/SOH_mlops/data/processed/data4'
+  lab: 'data/processed/lab'
+  real_ev: 'data/processed/data4'
 
 processing:
   lab:
