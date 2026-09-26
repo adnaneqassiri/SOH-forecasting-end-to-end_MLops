@@ -12,9 +12,9 @@ dependencies = [
     "numpy",
     "scipy",
     "PyYAML",
-    "EMD-signal",
+    "EMD-signal==1.6.4",
     "h5py",
-    "scikit-learn",
+    "scikit-learn==1.7.2",
     "joblib",
     "ucimlrepo",
 

@@ -27,11 +27,11 @@ def test_curve_image_round_trip_stays_within_pixel_resolution():
 def test_history_image_leaves_future_columns_blank():
     history = np.linspace(0.97, 0.93, HISTORY_LENGTH, dtype=np.float32)
     image = soh_to_image(history, avg=float(history.mean()))
-    expected_last_column = round(
+    expected_last_column = int(np.floor(
         (HISTORY_LENGTH - 1)
         * (MODEL_IMAGE_SHAPE[1] - 1)
         / (HISTORY_LENGTH + PREDICTION_LENGTH - 1)
-    )
+    ))
 
     assert np.any(image[:, expected_last_column] == 0.0)
     assert np.all(image[:, expected_last_column + 1 :] == 1.0)

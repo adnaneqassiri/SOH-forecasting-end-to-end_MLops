@@ -547,7 +547,9 @@ def process_cell(
             cycle_df
         )
 
-        if features is None:
+        if features is None or not all(
+            np.isfinite(value) for value in features.values()
+        ):
             continue
 
         row = {
@@ -579,7 +581,7 @@ def process_cell(
 def clean_dataset(
     df: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Final dataset cleaning."""
+    """Clean raw SOH into a separate, interpolated training target."""
 
     # Replace infinities
     df = df.replace(
@@ -621,21 +623,21 @@ def clean_dataset(
         ]
     )
 
-    local_median = df.groupby("cell_id")["SOH_hist"].transform(
-        lambda values: values.rolling(
-            window=5,
-            center=True,
-            min_periods=1,
-        ).median()
+    local_median = df.groupby("cell_index")["SOH_hist"].transform(
+        lambda values: values.rolling(5, center=True).median()
     )
     outliers = (df["SOH_hist"] - local_median).abs() > OUTLIER_THRESHOLD
     if outliers.any():
         LOGGER.warning(
-            "Dropping %d lab SOH outliers beyond %.4f of the local median",
+            "Interpolating %d lab SOH outliers beyond %.4f of the local median",
             int(outliers.sum()),
             OUTLIER_THRESHOLD,
         )
-        df = df.loc[~outliers]
+
+    df["soh_clean"] = df["SOH_hist"].mask(outliers)
+    df["soh_clean"] = df.groupby("cell_index")["soh_clean"].transform(
+        lambda values: values.interpolate(method="linear")
+    )
 
     return df.reset_index(drop=True)
 
@@ -733,6 +735,7 @@ def build_dataset() -> pd.DataFrame:
         "cell_id",
         "cycle_index",
         *FEATURES,
+        "soh_clean",
     ]
 
     missing_columns = [

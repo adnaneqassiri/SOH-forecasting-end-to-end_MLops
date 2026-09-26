@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 import yaml
 from dotenv import load_dotenv
+from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -91,7 +92,9 @@ def resolve_device(name):
 
 
 def split_group_ids(dataframe, split_config, seed):
-    ids = dataframe["vehicle_id"].drop_duplicates().to_numpy(dtype=int)
+    ids = dataframe["vehicle_id"].drop_duplicates().to_numpy(
+        dtype=int, copy=True
+    )
     explicit_keys = {"train", "val", "test"}
     if explicit_keys.issubset(split_config):
         split = {
@@ -147,11 +150,55 @@ def split_group_ids(dataframe, split_config, seed):
     }
 
 
+def split_lab_group_ids(dataframe, split_config):
+    """Reproduce the original lifetime-stratified LAB cell split."""
+    cell_stats = (
+        dataframe.groupby("vehicle_id")
+        .agg(number_cycles=("charge_block_id", "nunique"))
+        .reset_index()
+    )
+    cell_stats["lifetime_group"] = pd.qcut(
+        cell_stats["number_cycles"],
+        q=int(split_config["lifetime_quantiles"]),
+        labels=False,
+    )
+
+    parts = {"train": [], "val": [], "test": []}
+    for _, group in cell_stats.groupby("lifetime_group"):
+        train, remainder = train_test_split(
+            group,
+            test_size=float(split_config["remainder_fraction"]),
+            random_state=int(split_config["random_state"]),
+        )
+        val, test = train_test_split(
+            remainder,
+            test_size=(
+                1.0
+                - float(
+                    split_config["validation_fraction_of_remainder"]
+                )
+            ),
+            random_state=int(split_config["random_state"]),
+        )
+        parts["train"].append(train)
+        parts["val"].append(val)
+        parts["test"].append(test)
+
+    return {
+        name: (
+            pd.concat(group_parts)["vehicle_id"]
+            .astype(int)
+            .tolist()
+        )
+        for name, group_parts in parts.items()
+    }
+
+
 def build_datasets(stage, config, seed):
     split_config = config["training"]["splits"][stage]
     if stage == "lab":
         dataframe = load_lab_features()
-        split = split_group_ids(dataframe, split_config, seed)
+        split = split_lab_group_ids(dataframe, split_config)
         datasets = create_lab_multimodal_datasets(
             train_ids=split["train"],
             val_id=split["val"],
@@ -231,9 +278,15 @@ def train_model(
     checkpoint_path,
     device,
     mlflow_module,
+    selection_metric,
 ):
+    if selection_metric not in {"image_mse", "forecast_mae"}:
+        raise ValueError(
+            "selection_metric must be 'image_mse' or 'forecast_mae'"
+        )
+
     criterion = nn.MSELoss()
-    best_loss = float("inf")
+    best_selection_value = float("inf")
     epochs_without_improvement = 0
     history = []
 
@@ -271,43 +324,54 @@ def train_model(
             )
 
         train_loss = total_loss / total_samples
-        val_loss = mean_image_loss(
+        validation = evaluate_model(
             model,
             val_loader,
-            criterion,
             device,
-            description=f"Validate {epoch}/{stage_config['epochs']}",
+            PREDICTION_LENGTH,
             show_progress=bool(training_config["progress_bar"]),
+            description=f"Validate {epoch}/{stage_config['epochs']}",
         )
-        scheduler.step(val_loss)
+        val_loss = validation["image_mse"]
+        selection_value = (
+            validation["forecast_mae"]
+            if selection_metric == "forecast_mae"
+            else val_loss
+        )
+        scheduler.step(selection_value)
         learning_rate = float(optimizer.param_groups[0]["lr"])
         epoch_seconds = time.time() - started
         metrics = {
             "train_image_mse": train_loss,
             "val_image_mse": val_loss,
+            f"val_{selection_metric}": selection_value,
             "learning_rate": learning_rate,
             "epoch_seconds": epoch_seconds,
         }
         history.append({"epoch": epoch, **metrics})
         LOGGER.info(
-            "Epoch %d/%d | train_mse=%.6f | val_mse=%.6f | lr=%.2e",
+            "Epoch %d/%d | train_mse=%.6f | val_mse=%.6f | "
+            "%s=%.6f | lr=%.2e",
             epoch,
             int(stage_config["epochs"]),
             train_loss,
             val_loss,
+            selection_metric,
+            selection_value,
             learning_rate,
         )
         if mlflow_module is not None:
             mlflow_module.log_metrics(metrics, step=epoch)
 
-        if val_loss < best_loss:
-            best_loss = val_loss
+        if selection_value < best_selection_value:
+            best_selection_value = selection_value
             epochs_without_improvement = 0
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
                     "epoch": epoch,
-                    "best_val_image_mse": best_loss,
+                    "selection_metric": selection_metric,
+                    "best_selection_value": best_selection_value,
                     "image_representation": IMAGE_REPRESENTATION,
                 },
                 checkpoint_path,
@@ -501,6 +565,9 @@ def run_stage(stage, config, device, mlflow_module):
             checkpoint_path,
             device,
             mlflow_module,
+            selection_metric=(
+                "forecast_mae" if stage == "data4" else "image_mse"
+            ),
         )
         load_checkpoint(model, checkpoint_path, device)
         evaluation = evaluate_model(
