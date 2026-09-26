@@ -69,9 +69,15 @@ jobs:
         run: |
           mkdir -p ~/.ssh
           printf '%s' "${{ secrets.EC2_SSH_KEY_B64 }}" \
-            | base64 -d > ~/.ssh/ec2_key
+            | tr -d '[:space:]' \
+            | base64 --decode > ~/.ssh/ec2_key
+          sed -i 's/\r$//' ~/.ssh/ec2_key
+          printf '\n' >> ~/.ssh/ec2_key
           chmod 600 ~/.ssh/ec2_key
-          ssh-keygen -y -f ~/.ssh/ec2_key > /dev/null
+          if ! ssh-keygen -y -f ~/.ssh/ec2_key > /dev/null; then
+            echo "::error::EC2_SSH_KEY_B64 does not decode to a valid private key"
+            exit 1
+          fi
           ssh-keyscan -H "${{ secrets.EC2_HOST }}" \
             >> ~/.ssh/known_hosts
 
