@@ -24,6 +24,9 @@ dependencies = [
 
     "fastapi",
     "uvicorn[standard]",
+    "streamlit",
+    "requests",
+    "altair",
 
     "python-dotenv",
 ]

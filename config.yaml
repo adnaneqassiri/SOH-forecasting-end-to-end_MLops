@@ -19,6 +19,17 @@ sequence:
   history_length: 100
   prediction_length: 10
 
+# Fixed retrospective cutoffs used by the test-fleet dashboard. These are
+# zero-based row positions and match the original demo for direct comparison.
+inference:
+  test_snapshot_indices:
+    16: 125
+    67: 99
+    69: 580
+    152: 295
+    175: 221
+    176: 419
+
 features:
   lab:
     - t40_50
