@@ -57,13 +57,29 @@ The workflow in `.github/workflows/ci-cd.yml` tests pull requests and, after a
 push to `master`, publishes `DOCKERHUB_USERNAME/soh-app` and deploys the API and
 Streamlit containers to EC2.
 
-The model assets are not committed to Git. Provision these files once on EC2:
+The checkpoint and scaler are downloaded from MLflow before each deployment.
+Create `$HOME/soh-app.env` on EC2:
+
+```dotenv
+MLFLOW_URI=http://host.docker.internal:5000
+# Optional: pin a specific finished Data 4 run.
+# MLFLOW_RUN_ID=266d92b1908b4182bdc492b2f3a9eacb
+```
+
+When `MLFLOW_RUN_ID` is omitted, deployment selects the latest finished run
+tagged `stage=data4` from the `soh-training` experiment. If the MLflow artifact
+store requires direct S3 credentials, add the relevant `AWS_*` variables to
+the same env file or use an EC2 instance role.
+
+The workflow downloads the processed fleet CSV on every deployment from:
 
 ```text
-$HOME/soh-runtime/data/artifacts/data4_finetuning/best_model.pth
-$HOME/soh-runtime/data/artifacts/data4_finetuning/scaler.joblib
-$HOME/soh-runtime/data/processed/data4/real_ev.csv
+s3://soh-project/soh-runtime/data/real_ev.csv
 ```
+
+The EC2 instance must have AWS CLI installed and `s3:GetObject` permission for
+`arn:aws:s3:::soh-project/soh-runtime/data/real_ev.csv`. The download is staged
+under a temporary filename and moved into place only after it succeeds.
 
 The API is exposed on port `8000` and Streamlit on port `8501`.
 

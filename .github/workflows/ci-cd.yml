@@ -89,14 +89,35 @@ jobs:
 
             IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/soh-app:${{ github.sha }}"
             DATA_DIR="$HOME/soh-runtime/data"
+            ENV_FILE="$HOME/soh-app.env"
+            REAL_EV_S3_URI="s3://soh-project/soh-runtime/data/real_ev.csv"
+            REAL_EV_PATH="$DATA_DIR/processed/data4/real_ev.csv"
 
-            test -f "$DATA_DIR/artifacts/data4_finetuning/best_model.pth"
-            test -f "$DATA_DIR/artifacts/data4_finetuning/scaler.joblib"
-            test -f "$DATA_DIR/processed/data4/real_ev.csv"
+            test -f "$ENV_FILE"
+            command -v aws > /dev/null
 
             docker pull "$IMAGE"
             docker network inspect soh-network > /dev/null 2>&1 \
               || docker network create soh-network
+
+            mkdir -p "$DATA_DIR/processed/data4"
+            aws s3 cp \
+              "$REAL_EV_S3_URI" \
+              "$REAL_EV_PATH.download" \
+              --only-show-errors
+            mv "$REAL_EV_PATH.download" "$REAL_EV_PATH"
+            test -s "$REAL_EV_PATH"
+
+            mkdir -p "$DATA_DIR/artifacts/data4_finetuning"
+            docker run --rm \
+              --env-file "$ENV_FILE" \
+              --add-host host.docker.internal:host-gateway \
+              -v "$DATA_DIR:/app/data" \
+              "$IMAGE" \
+              python -m src.inference.download_artifacts
+
+            test -s "$DATA_DIR/artifacts/data4_finetuning/best_model.pth"
+            test -s "$DATA_DIR/artifacts/data4_finetuning/scaler.joblib"
             docker rm -f soh-api soh-frontend 2>/dev/null || true
 
             docker run -d \
