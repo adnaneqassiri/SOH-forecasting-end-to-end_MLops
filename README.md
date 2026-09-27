@@ -109,6 +109,8 @@ Relative paths are resolved from the repository root.
 
 ## Data preparation
 
+![Data processing workflow](assets/data-image.png)
+
 ### Laboratory data
 
 Place the raw MATLAB files under `data/raw/data 1`, then run:
@@ -152,6 +154,8 @@ data/processed/data4/vehicle_selection.csv
 ```
 
 ## Training and evaluation
+
+![Model development workflow](assets/model-dev-image.png)
 
 Create a local `.env` when MLflow tracking is enabled:
 
@@ -386,6 +390,8 @@ For production operation, run this command under `systemd` or another process
 manager so MLflow survives SSH disconnections and instance restarts.
 
 ## CI/CD deployment
+
+![Deployment architecture](assets/deployment.png)
 
 The workflow at `.github/workflows/ci-cd.yml` runs:
 
